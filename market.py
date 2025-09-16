@@ -1,4 +1,4 @@
-
+# market.py 
 import re
 import logging
 import time
@@ -192,7 +192,7 @@ def handle_market_forward(bot, message) -> None:
             qty = int(vals.get("quantity", 0) or 0)
             timestamp = int(msg_ts)
             try:
-                database.insert_market_record(resource, buy, sell, timestamp)
+                database.insert_market_record(resource, buy, sell, qty, timestamp)
                 saved += 1
             except Exception as e:
                 logger.exception(f"Ошибка сохранения записи рынка для {resource}: {e}")
@@ -219,6 +219,32 @@ def handle_market_forward(bot, message) -> None:
             bot.reply_to(message, "❌ Произошла внутренняя ошибка при обработке форварда.")
         except Exception:
             pass
+
+
+def calculate_speed(records: List[dict], price_field: str = "buy") -> Optional[float]:
+    if not records or len(records) < 2:
+        return None
+    first = records[0]
+    last = records[-1]
+    price_delta = last[price_field] - first[price_field]
+    time_delta_minutes = (last['timestamp'] - first['timestamp']) / 60.0
+    if time_delta_minutes < 0.1:
+        return None
+    speed = price_delta / time_delta_minutes
+    return round(speed, 6)
+
+
+def get_trend(records: List[dict], price_field: str = "buy") -> str:
+    if not records or len(records) < 2:
+        return "stable"
+    first_price = records[0][price_field]
+    last_price = records[-1][price_field]
+    if last_price > first_price:
+        return "up"
+    elif last_price < first_price:
+        return "down"
+    else:
+        return "stable"
 
 
 def _calculate_speed_from_records(records: List[dict], price_field: str = "buy") -> Optional[float]:
@@ -261,14 +287,7 @@ def compute_extrapolated_price(resource: str, user_id: Optional[int] = None, loo
         speed_buy_raw = _calculate_speed_from_records(recent, "buy")
         speed_sell_raw = _calculate_speed_from_records(recent, "sell")
 
-        trend = "stable"
-        if len(recent) >= 2:
-            first_price = recent[0]['buy']
-            last_price = recent[-1]['buy']
-            if last_price > first_price:
-                trend = "up"
-            elif last_price < first_price:
-                trend = "down"
+        trend = get_trend(recent, "buy")
 
         # get user bonus and get adjusted last prices
         try:
