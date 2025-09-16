@@ -2,6 +2,7 @@
 import sqlite3
 import time
 from typing import List, Optional, Dict
+import json
 
 DB_PATH = "bsp.db"
 
@@ -20,7 +21,9 @@ def init_db():
             bonus REAL DEFAULT 0,
             notify_enabled INTEGER DEFAULT 1,
             notify_interval INTEGER DEFAULT 15,
-            last_reminder INTEGER DEFAULT 0
+            last_reminder INTEGER DEFAULT 0,
+            anchor INTEGER DEFAULT 0,
+            trade_level INTEGER DEFAULT 0
         )
     """)
     c.execute("""
@@ -29,6 +32,7 @@ def init_db():
             resource TEXT,
             buy REAL,
             sell REAL,
+            quantity INTEGER,
             timestamp INTEGER
         )
     """)
@@ -59,12 +63,26 @@ def init_db():
             chat_id INTEGER PRIMARY KEY,
             notify_enabled INTEGER DEFAULT 1,
             notify_interval INTEGER DEFAULT 15,
-            pinned_message_id INTEGER
+            last_reminder INTEGER DEFAULT 0,
+            pinned_message_id INTEGER,
+            no_pin INTEGER DEFAULT 0,
+            profit_settings TEXT DEFAULT '{}'
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS chat_profit_alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER,
+            resource TEXT,
+            threshold_price REAL,
+            min_quantity INTEGER,
+            active INTEGER DEFAULT 1
         )
     """)
     conn.commit()
     conn.close()
 
+# User functions
 def ensure_user(user_id: int, username: str):
     conn = get_connection()
     c = conn.cursor()
@@ -87,10 +105,25 @@ def update_user_bonus(user_id: int, bonus: float):
     conn.commit()
     conn.close()
 
+def update_user_field(user_id: int, field: str, value):
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute(f"UPDATE users SET {field}=? WHERE id=?", (value, user_id))
+    conn.commit()
+    conn.close()
+
 def get_active_alerts() -> List[Dict]:
     conn = get_connection()
     c = conn.cursor()
     c.execute("SELECT * FROM alerts WHERE status='active'")
+    rows = c.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def get_user_active_alerts(user_id: int) -> List[Dict]:
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("SELECT * FROM alerts WHERE user_id=? AND status='active'", (user_id,))
     rows = c.fetchall()
     conn.close()
     return [dict(r) for r in rows]
@@ -128,16 +161,26 @@ def insert_alert_record(user_id: int, resource: str, target_price: float, direct
     c.execute("""
         INSERT INTO alerts (user_id, resource, target_price, direction, speed, current_price, alert_time, created_at, chat_id)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (user_id, resource, target_price, direction, speed, current_price, alert_time, time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)), chat_id))
+    """, (user_id, resource, target_price, direction, speed, current_price, alert_time, datetime.now().isoformat(), chat_id))
     alert_id = c.lastrowid
     conn.commit()
     conn.close()
     return alert_id
 
-def insert_market_record(resource: str, buy: float, sell: float, timestamp: int):
+def cancel_user_alerts(user_id: int) -> int:
     conn = get_connection()
     c = conn.cursor()
-    c.execute("INSERT INTO market (resource, buy, sell, timestamp) VALUES (?, ?, ?, ?)", (resource, buy, sell, timestamp))
+    c.execute("UPDATE alerts SET status='cancelled' WHERE user_id=? AND status='active'", (user_id,))
+    count = c.rowcount
+    conn.commit()
+    conn.close()
+    return count
+
+# Market functions
+def insert_market_record(resource: str, buy: float, sell: float, quantity: int, timestamp: int):
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("INSERT INTO market (resource, buy, sell, quantity, timestamp) VALUES (?, ?, ?, ?, ?)", (resource, buy, sell, quantity, timestamp))
     conn.commit()
     conn.close()
 
@@ -149,6 +192,14 @@ def get_latest_market(resource: str) -> Optional[Dict]:
     conn.close()
     return dict(row) if row else None
 
+def get_latest_market_all() -> List[Dict]:
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("SELECT * FROM market ORDER BY timestamp DESC LIMIT 4")
+    rows = c.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
 def get_recent_market(resource: str, minutes: int = 15) -> List[Dict]:
     cutoff = int(time.time()) - minutes * 60
     conn = get_connection()
@@ -158,6 +209,31 @@ def get_recent_market(resource: str, minutes: int = 15) -> List[Dict]:
     conn.close()
     return [dict(r) for r in rows]
 
+def get_market_history(resource: str, hours: int = 24) -> List[Dict]:
+    cutoff = int(time.time()) - hours * 3600
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("SELECT * FROM market WHERE resource=? AND timestamp>=? ORDER BY timestamp ASC", (resource, cutoff))
+    rows = c.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def get_market_week_range(resource: str, price_field: str, week_start: int) -> Tuple[float, float]:
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute(f"SELECT MIN({price_field}) as minp, MAX({price_field}) as maxp FROM market WHERE resource=? AND timestamp>=?", (resource, week_start))
+    row = c.fetchone()
+    conn.close()
+    return (row['minp'], row['maxp']) if row else (0, 0)
+
+def get_market_week_max_qty(resource: str, week_start: int) -> int:
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("SELECT MAX(quantity) as maxq FROM market WHERE resource=? AND timestamp>=?", (resource, week_start))
+    row = c.fetchone()
+    conn.close()
+    return row['maxq'] if row and row['maxq'] else 0
+
 def get_global_latest_timestamp() -> Optional[int]:
     conn = get_connection()
     c = conn.cursor()
@@ -166,13 +242,14 @@ def get_global_latest_timestamp() -> Optional[int]:
     conn.close()
     return row['ts'] if row and row['ts'] else None
 
+# Push settings
 def get_users_with_notifications_enabled() -> List[Dict]:
     conn = get_connection()
     c = conn.cursor()
-    c.execute("SELECT * FROM users WHERE notify_enabled=1")
+    c.execute("SELECT id, notify_interval, last_reminder FROM users WHERE notify_enabled=1")
     rows = c.fetchall()
     conn.close()
-    return [dict(r) for r in rows]
+    return [{"id": r[0], "notify_interval": r[1], "last_reminder": r[2]} for r in rows]
 
 def set_user_last_reminder(user_id: int, ts: int):
     conn = get_connection()
@@ -184,10 +261,10 @@ def set_user_last_reminder(user_id: int, ts: int):
 def get_chats_with_notifications_enabled() -> List[Dict]:
     conn = get_connection()
     c = conn.cursor()
-    c.execute("SELECT * FROM chats WHERE notify_enabled=1")
+    c.execute("SELECT chat_id, notify_interval, last_reminder FROM chats WHERE notify_enabled=1")
     rows = c.fetchall()
     conn.close()
-    return [dict(r) for r in rows]
+    return [{"chat_id": r[0], "notify_interval": r[1], "last_reminder": r[2]} for r in rows]
 
 def set_chat_last_reminder(chat_id: int, ts: int):
     conn = get_connection()
@@ -196,31 +273,6 @@ def set_chat_last_reminder(chat_id: int, ts: int):
     conn.commit()
     conn.close()
 
-def get_bot_stats() -> Dict:
-    conn = get_connection()
-    c = conn.cursor()
-    stats = {}
-    c.execute("SELECT COUNT(*) as cnt FROM users")
-    stats['users'] = c.fetchone()['cnt']
-    c.execute("SELECT COUNT(*) as cnt FROM market")
-    stats['resources'] = c.fetchone()['cnt']
-    for res in ['Камень', 'Дерево', 'Провизия']:
-        c.execute("SELECT buy FROM market WHERE resource=? ORDER BY timestamp DESC LIMIT 1", (res,))
-        row = c.fetchone()
-        stats[res.lower()] = row['buy'] if row else None
-    c.execute("SELECT MAX(buy) as maxw FROM market WHERE timestamp>=?", (int(time.time()) - 7*24*3600,))
-    stats['max_week'] = c.fetchone()['maxw']
-    conn.close()
-    return stats
-
-def get_bot_history(limit: int = 20) -> List[Dict]:
-    conn = get_connection()
-    c = conn.cursor()
-    c.execute("SELECT * FROM history ORDER BY timestamp DESC LIMIT ?", (limit,))
-    rows = c.fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
-
 def get_user_push_settings(user_id: int) -> Dict:
     conn = get_connection()
     c = conn.cursor()
@@ -228,7 +280,7 @@ def get_user_push_settings(user_id: int) -> Dict:
     row = c.fetchone()
     conn.close()
     if row:
-        return dict(row)
+        return {"enabled": bool(row[0]), "interval": row[1]}
     return {"enabled": True, "interval": 15}
 
 def update_user_push_settings(user_id: int, enabled: bool = None, interval: int = None):
@@ -241,21 +293,90 @@ def update_user_push_settings(user_id: int, enabled: bool = None, interval: int 
     conn.commit()
     conn.close()
 
-def upsert_chat_settings(chat_id: int, notify_enabled: bool, interval: int, pinned_message_id: int = None):
-    conn = get_connection()
-    c = conn.cursor()
-    c.execute("INSERT INTO chats (chat_id, notify_enabled, notify_interval, pinned_message_id) VALUES (?, ?, ?, ?) "
-              "ON CONFLICT(chat_id) DO UPDATE SET notify_enabled=excluded.notify_enabled, notify_interval=excluded.notify_interval, pinned_message_id=excluded.pinned_message_id",
-              (chat_id, 1 if notify_enabled else 0, interval, pinned_message_id))
-    conn.commit()
-    conn.close()
-
 def get_chat_settings(chat_id: int) -> Dict:
     conn = get_connection()
     c = conn.cursor()
     c.execute("SELECT * FROM chats WHERE chat_id=?", (chat_id,))
     row = c.fetchone()
     conn.close()
-    return dict(row) if row else {"notify_enabled": True, "notify_interval": 15, "pinned_message_id": None}
+    if row:
+        d = dict(row)
+        d['notify_enabled'] = bool(d['notify_enabled'])
+        d['profit_settings'] = json.loads(d['profit_settings'])
+        return d
+    return {"notify_enabled": True, "notify_interval": 15, "pinned_message_id": None, "no_pin": False, "profit_settings": {}}
+
+def upsert_chat_settings(chat_id: int, notify_enabled: bool, interval: int, pinned_message_id: int = None, no_pin: bool = None, profit_settings: dict = None):
+    conn = get_connection()
+    c = conn.cursor()
+    current = get_chat_settings(chat_id)
+    new_ps = json.dumps(current['profit_settings'] | (profit_settings or {}))
+    c.execute("""
+        INSERT INTO chats (chat_id, notify_enabled, notify_interval, pinned_message_id, no_pin, profit_settings) 
+        VALUES (?, ?, ?, ?, ?, ?) 
+        ON CONFLICT(chat_id) DO UPDATE SET 
+        notify_enabled=excluded.notify_enabled, 
+        notify_interval=excluded.notify_interval, 
+        pinned_message_id=excluded.pinned_message_id,
+        no_pin=excluded.no_pin,
+        profit_settings=excluded.profit_settings
+    """, (chat_id, 1 if notify_enabled else 0, interval, pinned_message_id, 1 if no_pin else 0, new_ps))
+    conn.commit()
+    conn.close()
+
+def set_chat_no_pin(chat_id: int, no_pin: bool):
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("UPDATE chats SET no_pin=? WHERE chat_id=?", (1 if no_pin else 0, chat_id))
+    conn.commit()
+    conn.close()
+
+def unpin_all_messages(chat_id: int):
+    # Placeholder: in real, use bot.unpin_chat_message
+    pass
+
+def get_chats_with_profit_alerts() -> List[Dict]:
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("SELECT DISTINCT chat_id FROM chat_profit_alerts WHERE active=1")
+    rows = c.fetchall()
+    conn.close()
+    return [{"chat_id": r[0]} for r in rows]
+
+def get_chat_profit_alerts(chat_id: int) -> List[Dict]:
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("SELECT * FROM chat_profit_alerts WHERE chat_id=? AND active=1", (chat_id,))
+    rows = c.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def deactivate_profit_alert(chat_id: int, resource: str):
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("UPDATE chat_profit_alerts SET active=0 WHERE chat_id=? AND resource=?", (chat_id, resource))
+    conn.commit()
+    conn.close()
+
+# Other
+def get_bot_stats() -> Dict:
+    # Legacy, but keep for compatibility
+    conn = get_connection()
+    c = conn.cursor()
+    stats = {}
+    c.execute("SELECT COUNT(*) as cnt FROM users")
+    stats['users'] = c.fetchone()['cnt']
+    c.execute("SELECT COUNT(DISTINCT resource) as cnt FROM market")
+    stats['resources'] = c.fetchone()['cnt']
+    conn.close()
+    return stats
+
+def get_bot_history(limit: int = 20) -> List[Dict]:
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute("SELECT * FROM history ORDER BY timestamp DESC LIMIT ?", (limit,))
+    rows = c.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
 init_db()
