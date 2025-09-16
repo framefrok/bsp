@@ -1,6 +1,9 @@
+# users.py
 from typing import Dict
-from database import upsert_user_settings, get_user_settings_db
 import logging
+import time
+
+import database
 
 logger = logging.getLogger(__name__)
 
@@ -9,15 +12,15 @@ def save_user_settings(user_id: int, has_anchor: bool, trade_level: int):
     """
     Сохраняет настройки пользователя: есть ли якорь и уровень торговли (0-10).
     """
-    upsert_user_settings(user_id, bool(has_anchor), int(trade_level))
+    database.upsert_user_settings(user_id, bool(has_anchor), int(trade_level))
     logger.info(f"Сохранены настройки для {user_id}: anchor={has_anchor}, trade_level={trade_level}")
 
 
 def get_user_settings(user_id: int) -> Dict[str, int]:
     """
-    Возвращает settings: {'has_anchor': 0/1, 'trade_level': int}
+    Возвращает settings: {'has_anchor': 0/1, 'trade_level': int, 'notify_personal', 'notify_interval'}
     """
-    return get_user_settings_db(user_id)
+    return database.get_user_settings_db(user_id)
 
 
 def get_user_bonus(user_id: int) -> float:
@@ -45,3 +48,14 @@ def adjust_prices_for_user(user_id: int, buy: float, sell: float):
         adj_buy = buy
         adj_sell = sell
     return adj_buy, adj_sell
+
+
+# Notification control
+def set_user_notification(user_id: int, enabled: bool, interval: int = 15):
+    database.set_user_notify(user_id, bool(enabled), int(interval))
+    logger.info(f"User {user_id} notify_personal set to {enabled} interval {interval}")
+
+
+def get_user_notification_settings(user_id: int) -> Dict[str, int]:
+    s = get_user_settings(user_id)
+    return {"notify_personal": s.get("notify_personal", 1), "notify_interval": s.get("notify_interval", 15), "last_reminder": s.get("last_reminder", 0)}
