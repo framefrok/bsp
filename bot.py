@@ -2,6 +2,7 @@ import logging
 import os
 from datetime import datetime
 import threading
+import time
 
 from dotenv import load_dotenv
 import telebot
@@ -94,7 +95,7 @@ def handle_trade_level(message):
         if level < 0 or level > 10:
             bot.reply_to(message, "❌ Уровень должен быть от 0 до 10.")
             return
-    except ValueError:
+    except Exception:
         bot.reply_to(message, "❌ Введите целое число от 0 до 10.")
         return
 
@@ -127,11 +128,9 @@ def cmd_push(message):
         lines = ["📊 <b>Текущий рынок:</b>"]
         for rec in resources:
             res = rec['resource']
-            # Сырые цены из БД
             raw_buy = rec['buy']
             raw_sell = rec['sell']
             adj_buy, adj_sell = users.adjust_prices_for_user(user_id, raw_buy, raw_sell)
-            # Форматируем
             lines.append(f"{res}: Купить {adj_buy:.2f} / Продать {adj_sell:.2f}")
 
         text = "\n".join(lines)
@@ -142,7 +141,8 @@ def cmd_push(message):
             try:
                 me = bot.get_me()
                 chat_member = bot.get_chat_member(message.chat.id, me.id)
-                if getattr(chat_member, "can_pin_messages", False) or getattr(chat_member, "status", "") == "creator":
+                can_pin = getattr(chat_member, "can_pin_messages", False) or getattr(chat_member, "status", "") == "creator"
+                if can_pin:
                     bot.pin_chat_message(message.chat.id, sent.message_id, disable_notification=True)
                 else:
                     bot.send_message(message.from_user.id, "⚠️ У бота нет прав закреплять сообщения в этой группе.")
@@ -157,21 +157,27 @@ def cmd_push(message):
 # -------------------------
 # Парсинг форвардов
 # -------------------------
-@bot.message_handler(func=lambda msg: isinstance(msg.text, str) and "🎪" in msg.text)
+@bot.message_handler(func=lambda msg: isinstance(getattr(msg, 'text', None), str) and "🎪" in msg.text)
 def forward_market_handler(message):
     """
     Обрабатываем пересланное сообщение с рынком (форвард).
+    Обязательно безопасно проверяем forward_from/forward_sender_name.
     """
-    # Проверим, что это пересылка
-    if not getattr(message, "forward_from", None) and not getattr(message, "forward_sender_name", None):
-        # Игнорируем обычные сообщения с эмодзи, ожидаем именно пересылку
+    # Проверим, что это пересылка (без прямого обращения)
+    forward_from = getattr(message, "forward_from", None)
+    forward_sender_name = getattr(message, "forward_sender_name", None)
+    if not forward_from and not forward_sender_name:
+        # ожидаем пересылку, если это не пересылка — игнорируем
         return
 
     try:
         market.handle_market_forward(bot, message)
     except Exception as e:
         logger.exception("Ошибка при обработке форварда")
-        bot.reply_to(message, "❌ Ошибка при обработке форварда.")
+        try:
+            bot.reply_to(message, "❌ Ошибка при обработке форварда.")
+        except Exception:
+            logger.error("Не удалось уведомить пользователя об ошибке при парсинге форварда.")
 
 
 # -------------------------
