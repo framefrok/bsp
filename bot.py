@@ -13,7 +13,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("MarketBot")
 
 # ⚙️ Инициализация бота
-API_TOKEN = "8289683909:AAGusWjdtuzvBoiFV42-CODErJB0xc1JSEY"
+API_TOKEN = ""
 bot = telebot.TeleBot(API_TOKEN, parse_mode="HTML")
 
 # =====================================================
