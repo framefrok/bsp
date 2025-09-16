@@ -44,7 +44,7 @@ def cmd_stat(message):
         if pred_buy is None:
             continue
         last_update_str = datetime.fromtimestamp(last_ts).strftime("%H:%M") if last_ts else "N/A"
-        was_buy, was_sell = users.adjust_prices_for_user(user_id, database.get_market_week_min_max(res, 'buy', week_start)[0], database.get_market_week_min_max(res, 'sell', week_start)[0])  # simplified
+        was_buy, was_sell = users.adjust_prices_for_user(user_id, database.get_market_week_max_qty(res, 'buy', week_start)[0], database.get_market_week_max_qty(res, 'sell', week_start)[0])  # simplified
         buy_range = database.get_market_week_range(res, 'buy', week_start)
         sell_range = database.get_market_week_range(res, 'sell', week_start)
         max_qty = database.get_market_week_max_qty(res, week_start)
