@@ -1,3 +1,4 @@
+# market.py
 import re
 import logging
 from datetime import datetime
@@ -5,8 +6,8 @@ from typing import Optional, Dict, Any
 import threading
 import time
 
-from database import insert_market_record, get_latest_market, get_recent_market
-from users import get_user_bonus, adjust_prices_for_user, get_user_settings
+import database
+import users
 
 logger = logging.getLogger(__name__)
 
@@ -19,13 +20,6 @@ EMOJI_TO_RESOURCE = {
 
 
 def parse_market_message(text: str) -> Optional[Dict[str, Dict[str, Any]]]:
-    """
-    Парсит сообщение рынка.
-    Возвращает словарь resource -> {buy, sell, quantity}
-    Поддерживает формат типа:
-      Дерево: 96,342,449🪵
-      📉Купить/продать: 8.31/6.80💰
-    """
     if not isinstance(text, str):
         return None
 
@@ -34,9 +28,7 @@ def parse_market_message(text: str) -> Optional[Dict[str, Dict[str, Any]]]:
     current_resource = None
     current_quantity = 0
 
-    # Паттерн для строки ресурса: "Название: число Эмодзи"
     resource_pattern = r"^(.+?):\s*([0-9,]*)\s*([🪵🪨🍞🐴])$"
-    # Паттерн для цен: "Купить/продать: 8.31/6.80"
     price_pattern = r"(?:[📈📉]?\s*)?Купить/продать:\s*([0-9]+(?:[.,][0-9]+)?)\s*/\s*([0-9]+(?:[.,][0-9]+)?)"
 
     for i, line in enumerate(lines):
@@ -48,7 +40,6 @@ def parse_market_message(text: str) -> Optional[Dict[str, Dict[str, Any]]]:
             name_part = res_match.group(1).strip()
             qty_str = res_match.group(2).replace(',', '').strip()
             emoji = res_match.group(3)
-
             current_resource = EMOJI_TO_RESOURCE.get(emoji, name_part)
             current_quantity = int(qty_str) if qty_str.isdigit() else 0
             continue
@@ -78,26 +69,17 @@ def parse_market_message(text: str) -> Optional[Dict[str, Dict[str, Any]]]:
 
 
 def handle_market_forward(bot, message):
-    """
-    Обработка пересланного сообщения с рынком.
-    Учитывает настройки бонусов у игрока, который прислал форвард (если они есть),
-    и сохраняет "сырые" цены в БД.
-    """
     try:
-        # безопасное получение forward_from и forward_sender_name
         forward_from = getattr(message, "forward_from", None)
         forward_sender_name = getattr(message, "forward_sender_name", None)
-
         if not forward_from and not forward_sender_name:
             bot.reply_to(message, "❌ Сообщение должно быть пересылкой от игрока или от бота рынка.")
             return
 
-        # безопасность: text и date
         text = getattr(message, "text", "") or ""
         msg_date = getattr(message, "date", None)
         timestamp = int(msg_date) if msg_date else int(time.time())
 
-        # логируем аккуратно — без прямого обращения к несуществующим атрибутам
         if forward_from:
             f_username = getattr(forward_from, "username", None)
             f_id = getattr(forward_from, "id", None)
@@ -112,9 +94,8 @@ def handle_market_forward(bot, message):
             bot.reply_to(message, "❌ Не удалось распознать данные рынка. Проверьте формат сообщения.")
             return
 
-        # определяем id отправителя пересылки (если есть) и его бонус
         forwarder_id = getattr(forward_from, "id", None) if forward_from else None
-        forwarder_bonus = get_user_bonus(forwarder_id) if forwarder_id else 0.0
+        forwarder_bonus = users.get_user_bonus(forwarder_id) if forwarder_id else 0.0
 
         saved = 0
         for resource, info in parsed.items():
@@ -122,10 +103,8 @@ def handle_market_forward(bot, message):
             sell = float(info.get("sell", 0.0))
             qty = int(info.get("quantity", 0) or 0)
 
-            # Если форвард прислал игрок с бонусом, то его цены — скорректированы.
-            # Надо вернуть "сырые" цены перед сохранением.
+            # Если форвард пришёл от игрока с бонусом — вернуть сырой
             if forwarder_bonus and forwarder_bonus > 0:
-                # forwarder_bonus — дробный (например 0.22)
                 raw_buy = buy * (1 + forwarder_bonus)
                 raw_sell = sell / (1 + forwarder_bonus)
             else:
@@ -134,17 +113,15 @@ def handle_market_forward(bot, message):
 
             date_iso = datetime.fromtimestamp(timestamp).isoformat()
             try:
-                insert_market_record(resource, raw_buy, raw_sell, qty, timestamp, date_iso, forwarder_id)
+                database.insert_market_record(resource, raw_buy, raw_sell, qty, timestamp, date_iso, forwarder_id)
                 saved += 1
             except Exception as e:
                 logger.error(f"Ошибка записи рынка для {resource}: {e}")
 
         if saved > 0:
             bot.reply_to(message, f"✅ Сохранено {saved} записей рынка (сырые цены).")
-            # После обновления рынка — запустим пересчёт таймеров один раз (если есть alerts)
             try:
                 import alerts
-                # update_dynamic_timers_once ожидает bot в нашем наборе модулей
                 threading.Thread(target=alerts.update_dynamic_timers_once, args=(bot,), daemon=True).start()
             except Exception as e:
                 logger.error(f"Не удалось запустить пересчёт таймеров: {e}")
@@ -157,3 +134,70 @@ def handle_market_forward(bot, message):
             bot.reply_to(message, f"❌ Ошибка при обработке форварда: {ex}")
         except Exception:
             logger.error("Не удалось отправить сообщение об ошибке пользователю.")
+
+
+# -------------------------
+# Extrapolation / helpers
+# -------------------------
+def calculate_speed(records: list, price_field: str = "buy") -> Optional[float]:
+    if not records or len(records) < 2:
+        return None
+    first = records[0]
+    last = records[-1]
+    price_delta = last[price_field] - first[price_field]
+    time_delta_minutes = (last['timestamp'] - first['timestamp']) / 60.0
+    if time_delta_minutes < 0.1:
+        return None
+    speed = price_delta / time_delta_minutes
+    return round(speed, 6)
+
+
+def get_trend(records: list, price_field: str = "buy") -> str:
+    if not records or len(records) < 2:
+        return "stable"
+    first_price = records[0][price_field]
+    last_price = records[-1][price_field]
+    if last_price > first_price:
+        return "up"
+    elif last_price < first_price:
+        return "down"
+    else:
+        return "stable"
+
+
+def compute_extrapolated_price(resource: str, user_id: int, lookback_minutes: int = 60):
+    """
+    Возвращает (pred_buy, pred_sell, trend, speed_adj, last_ts)
+    pred_* — скорректированные для пользователя текущие (экстраполированные) цены.
+    """
+    latest = database.get_latest_market(resource)
+    if not latest:
+        return None, None, "unknown", None, None
+
+    records = database.get_recent_market(resource, minutes=lookback_minutes)
+    last_ts = latest['timestamp']
+    raw_buy = latest['buy']
+    raw_sell = latest['sell']
+
+    bonus = users.get_user_bonus(user_id)
+    adj_buy, adj_sell = users.adjust_prices_for_user(user_id, raw_buy, raw_sell)
+
+    if not records or len(records) < 2:
+        # Без тренда — просто вернуть последнее скорректированное
+        return adj_buy, adj_sell, "stable", None, last_ts
+
+    speed_raw = calculate_speed(records, "buy")
+    if speed_raw is None:
+        return adj_buy, adj_sell, "stable", None, last_ts
+
+    # скорость для пользователя (скорректированная)
+    speed_adj = speed_raw / (1 + bonus) if isinstance(bonus, float) else speed_raw
+
+    # количество минут с последней записи
+    now_ts = int(time.time())
+    elapsed_minutes = (now_ts - last_ts) / 60.0
+    pred_buy = adj_buy + (speed_adj * elapsed_minutes) if speed_adj is not None else adj_buy
+    pred_sell = adj_sell + (speed_adj * elapsed_minutes) if speed_adj is not None else adj_sell
+
+    trend = get_trend(records, "buy")
+    return pred_buy, pred_sell, trend, speed_adj, last_ts
