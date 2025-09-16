@@ -1,9 +1,15 @@
 import logging
+import asyncio
 import telebot
 from telebot import types
-from database import init_db, get_db, save_pinned_message, get_pinned_messages, delete_pinned_message
+from datetime import datetime, timedelta
+
+from database import (
+    init_db, get_db,
+    save_pinned_message, get_pinned_messages, delete_pinned_message
+)
 from users import ensure_user, set_user_bonus, adjust_prices_for_user
-from alerts import check_alerts_for_user, set_timer, cancel_timer
+from alerts import check_alerts_for_user
 
 API_TOKEN = "YOUR_BOT_TOKEN"
 bot = telebot.TeleBot(API_TOKEN)
@@ -20,7 +26,11 @@ init_db()
 @bot.message_handler(commands=["start"])
 def cmd_start(message):
     ensure_user(message.from_user.id)
-    bot.reply_to(message, "👋 Привет! Я бот для отслеживания рынка.\nИспользуй /settings для бонусов, /push для уведомлений.")
+    bot.reply_to(
+        message,
+        "👋 Привет! Я бот для отслеживания рынка.\n"
+        "Используй /settings для бонусов, /push для уведомлений, /stat для статистики."
+    )
 
 
 @bot.message_handler(commands=["settings"])
@@ -81,13 +91,14 @@ def cmd_stat(message):
 
 @bot.message_handler(commands=["history"])
 def cmd_history(message):
-    """История изменений бота (заглушка)"""
+    """История изменений бота"""
     text = (
         "📜 История обновлений:\n"
         "v1.0 — старт\n"
         "v1.1 — бонусы\n"
         "v1.2 — push + закрепы\n"
         "v1.3 — stat/history\n"
+        "v1.4 — авто-уведомления и алерты\n"
     )
     bot.reply_to(message, text)
 
@@ -154,8 +165,76 @@ def callback_push(call):
 
 
 # ======================
+# Фоновые задачи
+# ======================
+
+async def check_market_updates():
+    """Проверка рынка и рассылка уведомлений"""
+    while True:
+        try:
+            db = get_db()
+            c = db.cursor()
+            c.execute("SELECT buy, sell, resource, amount, timestamp FROM market ORDER BY timestamp DESC LIMIT 1")
+            last = c.fetchone()
+
+            if not last:
+                await asyncio.sleep(900)
+                continue
+
+            ts = datetime.fromisoformat(last["timestamp"])
+            now = datetime.utcnow()
+            if now - ts > timedelta(minutes=15):
+                # уведомить все чаты с включенными пушами
+                c.execute("SELECT chat_id, pin_messages FROM push_settings WHERE enabled=1")
+                for row in c.fetchall():
+                    chat_id, pin = row
+                    msg = bot.send_message(chat_id, "⚠️ Внимание! Рынок не обновлялся более 15 минут.")
+                    if pin:
+                        try:
+                            bot.pin_chat_message(chat_id, msg.message_id)
+                            save_pinned_message(chat_id, msg.message_id)
+                            # чистим лишние закрепы
+                            pinned = get_pinned_messages(chat_id)
+                            if len(pinned) > 5:
+                                oldest = pinned[0]
+                                bot.unpin_chat_message(chat_id, oldest["message_id"])
+                                bot.delete_message(chat_id, oldest["message_id"])
+                                delete_pinned_message(oldest["id"])
+                        except Exception as e:
+                            logging.error(f"Ошибка при закреплении: {e}")
+
+            # проверка на выгодные цены (ресурсы >=10M)
+            if last["amount"] >= 10_000_000:
+                buy, sell = last["buy"], last["sell"]
+                resource = last["resource"]
+                # простая логика: если buy < sell (разница выгодная)
+                if buy < sell:
+                    c.execute("SELECT chat_id FROM push_settings WHERE enabled=1")
+                    for row in c.fetchall():
+                        chat_id = row["chat_id"]
+                        text = f"🔥 Пора брать! {resource} ожидает твоей покупки.\n@all"
+                        bot.send_message(chat_id, text)
+
+        except Exception as e:
+            logging.error(f"Ошибка фоновой проверки: {e}")
+
+        await asyncio.sleep(900)  # 15 минут
+
+
+# ======================
 # Запуск
 # ======================
 if __name__ == "__main__":
     logging.info("Бот запущен...")
-    bot.infinity_polling(skip_pending=True)
+
+    loop = asyncio.get_event_loop()
+    loop.create_task(check_market_updates())
+
+    # telebot.polling блокирует, поэтому запускаем в executor
+    from threading import Thread
+
+    def polling():
+        bot.infinity_polling(skip_pending=True)
+
+    Thread(target=polling, daemon=True).start()
+    loop.run_forever()
