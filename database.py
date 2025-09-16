@@ -1,7 +1,7 @@
 # database.py
 import sqlite3
 import time
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Tuple
 import json
 
 DB_PATH = "bsp.db"
