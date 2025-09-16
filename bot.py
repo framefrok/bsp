@@ -208,6 +208,47 @@ def handle_forward(message):
     if "🎪" in message.text:
         market.handle_market_forward(bot, message)
 
+# В bot.py
+@bot.message_handler(commands=['buyalert'])
+def cmd_buyalert(message):
+    if message.chat.type not in ['group', 'supergroup']:
+        bot.reply_to(message, "Эта команда работает только в групповых чатах.")
+        return
+
+    parts = message.text.split()[1:]
+    if len(parts) != 3:
+        bot.reply_to(message, "Использование: /buyalert <ресурс> <макс_цена> <мин_количество>\nПример: /buyalert Дерево 8.5 50000")
+        return
+
+    resource = parts[0].capitalize()
+    try:
+        threshold = float(parts[1])
+        min_qty = int(parts[2])
+    except ValueError:
+        bot.reply_to(message, "❌ Неверный формат. Цена — число, количество — целое число.")
+        return
+
+    if threshold <= 0 or min_qty <= 0:
+        bot.reply_to(message, "❌ Цена и количество должны быть положительными.")
+        return
+
+    chat_id = message.chat.id
+    # Вставляем или обновляем алерт
+    conn = database.get_connection()
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO chat_profit_alerts (chat_id, resource, threshold_price, min_quantity, active)
+        VALUES (?, ?, ?, ?, 1)
+        ON CONFLICT(chat_id, resource) DO UPDATE SET
+        threshold_price=excluded.threshold_price,
+        min_quantity=excluded.min_quantity,
+        active=1
+    """, (chat_id, resource, threshold, min_qty))
+    conn.commit()
+    conn.close()
+
+    bot.reply_to(message, f"✅ Алерт установлен: @{message.from_user.username} хочет купить {resource} по цене ≤ {threshold} при наличии ≥ {min_qty} шт.")
+
 def main():
     logger.info("Бот запущен.")
     try:
