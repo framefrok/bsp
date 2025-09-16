@@ -1,4 +1,3 @@
-
 # users.py
 import sqlite3
 import logging
@@ -9,21 +8,12 @@ import database
 logger = logging.getLogger(__name__)
 
 
-def ensure_user(user_id: int) -> None:
+def ensure_user(user_id: int, username: Optional[str] = None) -> None:
     """
     Проверяет, есть ли пользователь в БД, если нет — создаёт запись.
     """
     try:
-        conn = database.get_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT id FROM users WHERE id=?", (user_id,))
-        if not cur.fetchone():
-            cur.execute(
-                "INSERT INTO users (id, bonus, notify_enabled, notify_interval, last_reminder) VALUES (?, ?, ?, ?, ?)",
-                (user_id, 0.0, 1, 15, 0)
-            )
-            conn.commit()
-        conn.close()
+        database.ensure_user(user_id, username)
     except Exception:
         logger.exception(f"Ошибка при ensure_user {user_id}")
 
@@ -34,11 +24,7 @@ def set_user_bonus(user_id: int, bonus: float) -> None:
     """
     try:
         ensure_user(user_id)
-        conn = database.get_connection()
-        cur = conn.cursor()
-        cur.execute("UPDATE users SET bonus=? WHERE id=?", (float(bonus), user_id))
-        conn.commit()
-        conn.close()
+        database.update_user_bonus(user_id, float(bonus))
     except Exception:
         logger.exception(f"Ошибка при set_user_bonus {user_id}")
 
@@ -49,14 +35,8 @@ def get_user_bonus(user_id: int) -> float:
     """
     try:
         ensure_user(user_id)
-        conn = database.get_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT bonus FROM users WHERE id=?", (user_id,))
-        row = cur.fetchone()
-        conn.close()
-        if row:
-            return float(row[0])
-        return 0.0
+        user = database.get_user(user_id)
+        return float(user.get('bonus', 0.0)) if user else 0.0
     except Exception:
         logger.exception(f"Ошибка при get_user_bonus {user_id}")
         return 0.0
@@ -83,11 +63,7 @@ def set_user_notify(user_id: int, enabled: bool) -> None:
     """
     try:
         ensure_user(user_id)
-        conn = database.get_connection()
-        cur = conn.cursor()
-        cur.execute("UPDATE users SET notify_enabled=? WHERE id=?", (1 if enabled else 0, user_id))
-        conn.commit()
-        conn.close()
+        database.update_user_push_settings(user_id, enabled=enabled)
     except Exception:
         logger.exception(f"Ошибка при set_user_notify {user_id}")
 
@@ -98,11 +74,7 @@ def set_user_notify_interval(user_id: int, interval_minutes: int) -> None:
     """
     try:
         ensure_user(user_id)
-        conn = database.get_connection()
-        cur = conn.cursor()
-        cur.execute("UPDATE users SET notify_interval=? WHERE id=?", (interval_minutes, user_id))
-        conn.commit()
-        conn.close()
+        database.update_user_push_settings(user_id, interval=interval_minutes)
     except Exception:
         logger.exception(f"Ошибка при set_user_notify_interval {user_id}")
 
@@ -113,14 +85,8 @@ def get_user_notify_settings(user_id: int) -> Tuple[bool, int]:
     """
     try:
         ensure_user(user_id)
-        conn = database.get_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT notify_enabled, notify_interval FROM users WHERE id=?", (user_id,))
-        row = cur.fetchone()
-        conn.close()
-        if row:
-            return bool(row[0]), int(row[1])
-        return True, 15
+        settings = database.get_user_push_settings(user_id)
+        return settings['enabled'], settings['interval']
     except Exception:
         logger.exception(f"Ошибка при get_user_notify_settings {user_id}")
         return True, 15
@@ -132,11 +98,7 @@ def set_user_last_reminder(user_id: int, timestamp: int) -> None:
     """
     try:
         ensure_user(user_id)
-        conn = database.get_connection()
-        cur = conn.cursor()
-        cur.execute("UPDATE users SET last_reminder=? WHERE id=?", (timestamp, user_id))
-        conn.commit()
-        conn.close()
+        database.set_user_last_reminder(user_id, timestamp)
     except Exception:
         logger.exception(f"Ошибка при set_user_last_reminder {user_id}")
 
@@ -146,15 +108,7 @@ def get_users_with_notifications_enabled() -> list[dict]:
     Возвращает список словарей пользователей, у которых включены уведомления.
     """
     try:
-        conn = database.get_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT id, notify_interval, last_reminder FROM users WHERE notify_enabled=1")
-        rows = cur.fetchall()
-        conn.close()
-        result = []
-        for r in rows:
-            result.append({"id": r[0], "notify_interval": r[1], "last_reminder": r[2]})
-        return result
+        return database.get_users_with_notifications_enabled()
     except Exception:
         logger.exception("Ошибка при get_users_with_notifications_enabled")
         return []
