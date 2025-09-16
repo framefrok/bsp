@@ -1,61 +1,81 @@
-# users.py
-from typing import Dict
-import logging
-import time
+import sqlite3
+from database import get_connection
 
-import database
+# Создаём таблицу пользователей если её нет
+def init_users_table():
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            bonus_active INTEGER DEFAULT 0,
+            push_enabled INTEGER DEFAULT 1,
+            group_push_enabled INTEGER DEFAULT 1,
+            push_interval INTEGER DEFAULT 15,
+            pin_enabled INTEGER DEFAULT 0
+        )
+        """)
+        conn.commit()
 
-logger = logging.getLogger(__name__)
+# Проверка и добавление пользователя
+def ensure_user(user_id: int, username: str = None):
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,))
+        if cursor.fetchone() is None:
+            cursor.execute("""
+            INSERT INTO users (user_id, username)
+            VALUES (?, ?)
+            """, (user_id, username))
+            conn.commit()
 
+# Включить / выключить бонус
+def set_user_bonus(user_id: int, active: bool):
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE users SET bonus_active=? WHERE user_id=?", (1 if active else 0, user_id))
+        conn.commit()
 
-def save_user_settings(user_id: int, has_anchor: bool, trade_level: int):
-    """
-    Сохраняет настройки пользователя: есть ли якорь и уровень торговли (0-10).
-    """
-    database.upsert_user_settings(user_id, bool(has_anchor), int(trade_level))
-    logger.info(f"Сохранены настройки для {user_id}: anchor={has_anchor}, trade_level={trade_level}")
+# Настройка push
+def set_push_settings(user_id: int, enabled: bool = None, interval: int = None, group_enabled: bool = None, pin_enabled: bool = None):
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        if enabled is not None:
+            cursor.execute("UPDATE users SET push_enabled=? WHERE user_id=?", (1 if enabled else 0, user_id))
+        if group_enabled is not None:
+            cursor.execute("UPDATE users SET group_push_enabled=? WHERE user_id=?", (1 if group_enabled else 0, user_id))
+        if interval is not None:
+            cursor.execute("UPDATE users SET push_interval=? WHERE user_id=?", (interval, user_id))
+        if pin_enabled is not None:
+            cursor.execute("UPDATE users SET pin_enabled=? WHERE user_id=?", (1 if pin_enabled else 0, user_id))
+        conn.commit()
 
+# Получение настроек push
+def get_push_settings(user_id: int):
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT push_enabled, push_interval, group_push_enabled, pin_enabled FROM users WHERE user_id=?", (user_id,))
+        row = cursor.fetchone()
+        if row:
+            return {
+                "push_enabled": bool(row[0]),
+                "push_interval": row[1],
+                "group_push_enabled": bool(row[2]),
+                "pin_enabled": bool(row[3])
+            }
+        return None
 
-def get_user_settings(user_id: int) -> Dict[str, int]:
-    """
-    Возвращает settings: {'has_anchor': 0/1, 'trade_level': int, 'notify_personal', 'notify_interval'}
-    """
-    return database.get_user_settings_db(user_id)
+# Проверка бонуса пользователя
+def has_bonus(user_id: int) -> bool:
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT bonus_active FROM users WHERE user_id=?", (user_id,))
+        row = cursor.fetchone()
+        return bool(row[0]) if row else False
 
-
-def get_user_bonus(user_id: int) -> float:
-    """
-    Возвращает бонус в виде дробного коэффициента (например 0.22 для +22%).
-    Формула: +2% от наличия якоря + 2% * trade_level.
-    """
-    s = get_user_settings(user_id)
-    bonus = 0.02 if s.get("has_anchor", 0) else 0.0
-    bonus += 0.02 * int(s.get("trade_level", 0))
-    return float(bonus)
-
-
-def adjust_prices_for_user(user_id: int, buy: float, sell: float):
-    """
-    Применяет бонусы пользователя к "сырым" ценам:
-       покупка дешевле: buy_adj = buy / (1 + bonus)
-       продажа дороже: sell_adj = sell * (1 + bonus)
-    """
-    bonus = get_user_bonus(user_id)
-    try:
-        adj_buy = float(buy) / (1 + bonus) if buy is not None else None
-        adj_sell = float(sell) * (1 + bonus) if sell is not None else None
-    except Exception:
-        adj_buy = buy
-        adj_sell = sell
-    return adj_buy, adj_sell
-
-
-# Notification control
-def set_user_notification(user_id: int, enabled: bool, interval: int = 15):
-    database.set_user_notify(user_id, bool(enabled), int(interval))
-    logger.info(f"User {user_id} notify_personal set to {enabled} interval {interval}")
-
-
-def get_user_notification_settings(user_id: int) -> Dict[str, int]:
-    s = get_user_settings(user_id)
-    return {"notify_personal": s.get("notify_personal", 1), "notify_interval": s.get("notify_interval", 15), "last_reminder": s.get("last_reminder", 0)}
+# Фильтрация цен с учётом бонуса
+def adjust_prices_for_user(user_id: int, base_price: int) -> int:
+    if has_bonus(user_id):
+        return int(base_price * 1.1)  # бонус даёт +10% к цене
+    return base_price
