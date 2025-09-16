@@ -1,6 +1,7 @@
+# database.py
 import sqlite3
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any
 
 DB_FILE = "marketbot.db"
@@ -19,17 +20,31 @@ def init_db():
     db = get_db()
     c = db.cursor()
 
-    # Пользователи — настройки (якорь, уровень торговли)
+    # Пользователи — настройки (якорь, уровень торговли) + уведомления
     c.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY,
             has_anchor INTEGER DEFAULT 0,
             trade_level INTEGER DEFAULT 0,
+            notify_personal INTEGER DEFAULT 1,
+            notify_interval INTEGER DEFAULT 15,
+            last_reminder INTEGER DEFAULT 0,
             updated_at INTEGER DEFAULT (strftime('%s','now'))
         )
     """)
 
-    # Рынок — храним "сырые" цены (без учёта бонусов у игроков)
+    # Группы/чаты — настройки уведомлений для чата
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS chats (
+            chat_id INTEGER PRIMARY KEY,
+            notify_chat INTEGER DEFAULT 1,
+            notify_interval INTEGER DEFAULT 15,
+            last_reminder INTEGER DEFAULT 0,
+            pinned_message_id INTEGER
+        )
+    """)
+
+    # Рынок — сырые данные (без бонусов)
     c.execute("""
         CREATE TABLE IF NOT EXISTS market (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -62,7 +77,7 @@ def init_db():
         )
     """)
 
-    # Индексы для ускорения выборок
+    # Индексы
     c.execute("CREATE INDEX IF NOT EXISTS idx_market_resource_ts ON market(resource, timestamp)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_alerts_status ON alerts(status)")
 
@@ -86,9 +101,7 @@ def insert_market_record(resource: str, buy: float, sell: float, quantity: int, 
 def get_latest_market(resource: str) -> Optional[Dict[str, Any]]:
     db = get_db()
     c = db.cursor()
-    c.execute("""
-        SELECT * FROM market WHERE resource = ? ORDER BY timestamp DESC LIMIT 1
-    """, (resource,))
+    c.execute("SELECT * FROM market WHERE resource = ? ORDER BY timestamp DESC LIMIT 1", (resource,))
     row = c.fetchone()
     return dict(row) if row else None
 
@@ -97,28 +110,61 @@ def get_recent_market(resource: str, minutes: int = 15) -> List[Dict[str, Any]]:
     cutoff = int(time.time()) - minutes * 60
     db = get_db()
     c = db.cursor()
-    c.execute("""
-        SELECT * FROM market WHERE resource = ? AND timestamp >= ? ORDER BY timestamp ASC
-    """, (resource, cutoff))
+    c.execute("SELECT * FROM market WHERE resource = ? AND timestamp >= ? ORDER BY timestamp ASC", (resource, cutoff))
     rows = c.fetchall()
     return [dict(r) for r in rows]
 
 
-def get_all_latest() -> List[Dict[str, Any]]:
-    """
-    Возвращает список последних записей для каждого ресурса.
-    """
+def get_market_history(resource: str, limit: int = 50) -> List[Dict[str, Any]]:
     db = get_db()
     c = db.cursor()
-    # Получим список уникальных ресурсов, затем для каждого — последняя запись
+    c.execute("SELECT * FROM market WHERE resource = ? ORDER BY timestamp DESC LIMIT ?", (resource, limit))
+    rows = c.fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_global_latest_timestamp() -> Optional[int]:
+    db = get_db()
+    c = db.cursor()
+    c.execute("SELECT MAX(timestamp) as ts FROM market")
+    r = c.fetchone()
+    return int(r["ts"]) if r and r["ts"] is not None else None
+
+
+def get_week_max_qty(resource: str) -> int:
+    cutoff = int((datetime.now() - timedelta(days=7)).timestamp())
+    db = get_db()
+    c = db.cursor()
+    c.execute("SELECT MAX(quantity) as mq FROM market WHERE resource = ? AND timestamp >= ?", (resource, cutoff))
+    r = c.fetchone()
+    return int(r["mq"]) if r and r["mq"] is not None else 0
+
+
+def get_all_latest() -> List[Dict[str, Any]]:
+    db = get_db()
+    c = db.cursor()
     c.execute("SELECT DISTINCT resource FROM market")
     resources = [r["resource"] for r in c.fetchall()]
     result = []
     for res in resources:
-        row = get_latest_market(res)
-        if row:
-            result.append(row)
+        m = get_latest_market(res)
+        if m:
+            result.append(m)
     return result
+
+
+def get_total_market_records() -> int:
+    db = get_db()
+    c = db.cursor()
+    c.execute("SELECT COUNT(*) as cnt FROM market")
+    return int(c.fetchone()["cnt"])
+
+
+def get_unique_resources_count() -> int:
+    db = get_db()
+    c = db.cursor()
+    c.execute("SELECT COUNT(DISTINCT resource) as cnt FROM market")
+    return int(c.fetchone()["cnt"])
 
 
 # -------------------------
@@ -127,26 +173,91 @@ def get_all_latest() -> List[Dict[str, Any]]:
 def upsert_user_settings(user_id: int, has_anchor: bool, trade_level: int):
     db = get_db()
     c = db.cursor()
-    # INSERT OR REPLACE: перезапишем/вставим
-    c.execute("""
-        INSERT INTO users (id, has_anchor, trade_level, updated_at)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-            has_anchor = excluded.has_anchor,
-            trade_level = excluded.trade_level,
-            updated_at = excluded.updated_at
-    """, (int(user_id), int(has_anchor), int(trade_level), int(time.time())))
+    # Создаём запись, если её нет
+    c.execute("INSERT OR IGNORE INTO users (id) VALUES (?)", (int(user_id),))
+    c.execute("UPDATE users SET has_anchor = ?, trade_level = ?, updated_at = ? WHERE id = ?",
+              (1 if has_anchor else 0, int(trade_level), int(time.time()), int(user_id)))
     db.commit()
 
 
-def get_user_settings_db(user_id: int) -> Dict[str, int]:
+def get_user_settings_db(user_id: int) -> Dict[str, Any]:
     db = get_db()
     c = db.cursor()
-    c.execute("SELECT has_anchor, trade_level FROM users WHERE id = ?", (int(user_id),))
+    c.execute("SELECT has_anchor, trade_level, notify_personal, notify_interval, last_reminder FROM users WHERE id = ?", (int(user_id),))
     row = c.fetchone()
     if not row:
-        return {"has_anchor": 0, "trade_level": 0}
-    return {"has_anchor": int(row["has_anchor"]), "trade_level": int(row["trade_level"])}
+        return {"has_anchor": 0, "trade_level": 0, "notify_personal": 1, "notify_interval": 15, "last_reminder": 0}
+    return {"has_anchor": int(row["has_anchor"]), "trade_level": int(row["trade_level"]),
+            "notify_personal": int(row["notify_personal"]), "notify_interval": int(row["notify_interval"]),
+            "last_reminder": int(row["last_reminder"])}
+
+
+def set_user_notify(user_id: int, enabled: bool, interval: int):
+    db = get_db()
+    c = db.cursor()
+    c.execute("INSERT OR IGNORE INTO users (id) VALUES (?)", (int(user_id),))
+    c.execute("UPDATE users SET notify_personal = ?, notify_interval = ?, updated_at = ? WHERE id = ?",
+              (1 if enabled else 0, int(interval), int(time.time()), int(user_id)))
+    db.commit()
+
+
+def set_user_last_reminder(user_id: int, ts: int):
+    db = get_db()
+    c = db.cursor()
+    c.execute("UPDATE users SET last_reminder = ? WHERE id = ?", (int(ts), int(user_id)))
+    db.commit()
+
+
+def get_users_with_notifications_enabled() -> List[Dict[str, Any]]:
+    db = get_db()
+    c = db.cursor()
+    c.execute("SELECT id, notify_interval, last_reminder FROM users WHERE notify_personal = 1")
+    return [dict(r) for r in c.fetchall()]
+
+
+def get_users_count() -> int:
+    db = get_db()
+    c = db.cursor()
+    c.execute("SELECT COUNT(*) as cnt FROM users")
+    return int(c.fetchone()["cnt"])
+
+
+# -------------------------
+# Chats / group helpers
+# -------------------------
+def upsert_chat_settings(chat_id: int, notify_chat: bool, notify_interval: int, pinned_message_id: Optional[int] = None):
+    db = get_db()
+    c = db.cursor()
+    c.execute("INSERT OR IGNORE INTO chats (chat_id) VALUES (?)", (int(chat_id),))
+    # update fields
+    c.execute("UPDATE chats SET notify_chat = ?, notify_interval = ?, pinned_message_id = ? WHERE chat_id = ?",
+              (1 if notify_chat else 0, int(notify_interval), pinned_message_id, int(chat_id)))
+    db.commit()
+
+
+def get_chat_settings(chat_id: int) -> Dict[str, Any]:
+    db = get_db()
+    c = db.cursor()
+    c.execute("SELECT notify_chat, notify_interval, last_reminder, pinned_message_id FROM chats WHERE chat_id = ?", (int(chat_id),))
+    r = c.fetchone()
+    if not r:
+        return {"notify_chat": 0, "notify_interval": 15, "last_reminder": 0, "pinned_message_id": None}
+    return {"notify_chat": int(r["notify_chat"]), "notify_interval": int(r["notify_interval"]),
+            "last_reminder": int(r["last_reminder"]), "pinned_message_id": r["pinned_message_id"]}
+
+
+def get_chats_with_notifications_enabled() -> List[Dict[str, Any]]:
+    db = get_db()
+    c = db.cursor()
+    c.execute("SELECT chat_id, notify_interval, last_reminder FROM chats WHERE notify_chat = 1")
+    return [dict(r) for r in c.fetchall()]
+
+
+def set_chat_last_reminder(chat_id: int, ts: int):
+    db = get_db()
+    c = db.cursor()
+    c.execute("UPDATE chats SET last_reminder = ? WHERE chat_id = ?", (int(ts), int(chat_id)))
+    db.commit()
 
 
 # -------------------------
@@ -198,9 +309,6 @@ def update_alert_status(alert_id: int, status: str):
 
 
 def update_alert_fields(alert_id: int, fields: Dict[str, Any]):
-    """
-    fields: словарь name->value
-    """
     if not fields:
         return
     db = get_db()
@@ -210,8 +318,15 @@ def update_alert_fields(alert_id: int, fields: Dict[str, Any]):
     for k, v in fields.items():
         keys.append(f"{k} = ?")
         vals.append(v)
+    vals.append(datetime.now().isoformat())
     vals.append(int(alert_id))
     sql = f"UPDATE alerts SET {', '.join(keys)}, last_checked = ? WHERE id = ?"
-    vals.insert(-1, datetime.now().isoformat())
     c.execute(sql, vals)
     db.commit()
+
+
+def get_active_alerts_count() -> int:
+    db = get_db()
+    c = db.cursor()
+    c.execute("SELECT COUNT(*) as cnt FROM alerts WHERE status = 'active'")
+    return int(c.fetchone()["cnt"])
