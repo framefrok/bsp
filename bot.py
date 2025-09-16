@@ -1,3 +1,5 @@
+# bot.py 
+
 import logging
 import telebot
 from telebot import types
@@ -43,11 +45,9 @@ def cmd_stat(message):
         if pred_buy is None:
             continue
         last_update_str = datetime.fromtimestamp(last_ts).strftime("%H:%M") if last_ts else "N/A"
-        was_buy, was_sell = users.adjust_prices_for_user(
-            user_id,
-            database.get_market_week_max_qty(res, 'buy', week_start)[0],
-            database.get_market_week_max_qty(res, 'sell', week_start)[0]
-        )  # simplified
+        was_buy = database.get_market_week_max_price(res, 'buy', week_start)
+        was_sell = database.get_market_week_max_price(res, 'sell', week_start)
+        was_buy_adj, was_sell_adj = users.adjust_prices_for_user(user_id, was_buy, was_sell)
         buy_range = database.get_market_week_range(res, 'buy', week_start)
         sell_range = database.get_market_week_range(res, 'sell', week_start)
         max_qty = database.get_market_week_max_qty(res, week_start)
@@ -55,9 +55,9 @@ def cmd_stat(message):
         speed_str = f"{speed:+.4f}/мин" if speed else "0"
         reply += f"{market.RESOURCE_EMOJI.get(res, '')} {res}\n"
         reply += f"├ 🕒 Последнее обновление: {last_update_str}\n"
-        reply += f"├ 💹 Покупка: {pred_buy:>8.3f} (было: {was_buy:.3f})\n"
+        reply += f"├ 💹 Покупка: {pred_buy:>8.3f} (было: {was_buy_adj:.3f})\n"
         reply += f"│   Диапазон за неделю: {buy_range[0]:.3f} — {buy_range[1]:.3f}\n"
-        reply += f"├ 💰 Продажа: {pred_sell:>8.3f} (было: {was_sell:.3f})\n"
+        reply += f"├ 💰 Продажа: {pred_sell:>8.3f} (было: {was_sell_adj:.3f})\n"
         reply += f"│   Диапазон за неделю: {sell_range[0]:.3f} — {sell_range[1]:.3f}\n"
         reply += f"├ 📦 Макс. объём: {max_qty:,} шт.\n"
         reply += f"└ 📊 Тренд: {trend_emoji} {'растёт' if trend=='up' else 'падает' if trend=='down' else 'стабилен'} ({speed_str})\n\n"
