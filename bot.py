@@ -6,6 +6,7 @@ import database
 import users
 import alerts
 import market
+import time
 from datetime import datetime
 
 TOKEN = "YOUR_BOT_TOKEN_HERE"
