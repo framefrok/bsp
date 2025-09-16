@@ -12,6 +12,11 @@ def get_db():
         _db.row_factory = sqlite3.Row
     return _db
 
+def get_connection():
+    """Возвращает новое соединение с базой данных"""
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
+
+
 
 def init_db():
     """Создание таблиц"""
