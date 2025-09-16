@@ -1,14 +1,13 @@
+# alerts.py
 import threading
 import time
 import logging
 from datetime import datetime, timedelta
 from typing import List, Optional
 
-from database import (
-    insert_alert_record, get_active_alerts, get_alert_by_id, get_latest_market,
-    get_recent_market, update_alert_status, update_alert_fields, get_all_latest
-)
-from users import get_user_bonus, adjust_prices_for_user
+import database
+import users
+import market
 
 logger = logging.getLogger(__name__)
 
@@ -20,9 +19,6 @@ def calculate_speed(records: List[dict], price_field: str = "buy") -> Optional[f
     last = records[-1]
     price_delta = last[price_field] - first[price_field]
     time_delta_minutes = (last['timestamp'] - first['timestamp']) / 60.0
-    if time_delta_minutes == 0:
-        return None
-    # Защитный порог
     if time_delta_minutes < 0.1:
         return None
     speed = price_delta / time_delta_minutes
@@ -43,11 +39,8 @@ def get_trend(records: List[dict], price_field: str = "buy") -> str:
 
 
 def schedule_alert(alert_id: int, bot):
-    """
-    Sleep пока до alert_time и затем проверяем — отправляем уведомление.
-    """
     try:
-        alert = get_alert_by_id(alert_id)
+        alert = database.get_alert_by_id(alert_id)
         if not alert:
             return
 
@@ -57,15 +50,16 @@ def schedule_alert(alert_id: int, bot):
         if sleep_s > 0:
             time.sleep(sleep_s)
 
-        # Повторная проверка условий
-        current = get_latest_market(alert['resource'])
+        current = database.get_latest_market(alert['resource'])
         if not current:
-            bot.send_message(alert['user_id'], f"⚠️ Невозможно проверить цель: нет данных по {alert['resource']}.")
-            update_alert_status(alert_id, 'error')
+            try:
+                bot.send_message(alert['user_id'], f"⚠️ Невозможно проверить цель: нет данных по {alert['resource']}.")
+            except Exception:
+                pass
+            database.update_alert_status(alert_id, 'error')
             return
 
-        # Применим бонусы пользователя к текущей сырой цене
-        current_price_adj, _ = adjust_prices_for_user(alert['user_id'], current['buy'], current['sell'])
+        current_price_adj, _ = users.adjust_prices_for_user(alert['user_id'], current['buy'], current['sell'])
 
         reached = False
         if alert['direction'] == 'down' and current_price_adj <= alert['target_price']:
@@ -73,135 +67,111 @@ def schedule_alert(alert_id: int, bot):
         if alert['direction'] == 'up' and current_price_adj >= alert['target_price']:
             reached = True
 
-        try:
-            username = None
-            # Попробуем получить username через Telegram API (без ошибки в случае невозможности)
-            # Бот может не иметь доступа — отлавливаем исключения в bot.send_message
-            if reached:
-                text = (
-                    f"🔔 Ваш таймер сработал!\n"
-                    f"{alert['resource']} достигла цели {alert['target_price']:.2f}\n"
-                    f"Текущая цена: {current_price_adj:.2f}\n"
-                )
-                bot.send_message(alert['user_id'], text)
-                update_alert_status(alert_id, 'completed')
-            else:
-                text = (
-                    f"⏰ Таймер сработал, но цель ({alert['target_price']:.2f}) ещё не достигнута.\n"
-                    f"Текущая цена: {current_price_adj:.2f}\n"
-                    f"Возможно, направление рынка изменилось."
-                )
-                bot.send_message(alert['user_id'], text)
-                update_alert_status(alert_id, 'expired')
-        except Exception as e:
-            logger.error(f"Не удалось уведомить пользователя при срабатывании alert {alert_id}: {e}")
-            update_alert_status(alert_id, 'error')
+        if reached:
+            try:
+                bot.send_message(alert['user_id'], f"🔔 Ваш таймер сработал! {alert['resource']} достигла {alert['target_price']:.2f}. Текущая: {current_price_adj:.2f}")
+            except Exception:
+                pass
+            database.update_alert_status(alert_id, 'completed')
+            # notify group if set
+            try:
+                if alert.get('chat_id'):
+                    bot.send_message(alert['chat_id'], f"🔔 Таймер @{alert['user_id']} сработал: {alert['resource']} достигла {alert['target_price']:.2f} (текущая: {current_price_adj:.2f}).")
+            except Exception:
+                pass
+        else:
+            try:
+                bot.send_message(alert['user_id'], f"⏰ Таймер сработал, но цель ({alert['target_price']:.2f}) не достигнута. Текущая: {current_price_adj:.2f}")
+            except Exception:
+                pass
+            database.update_alert_status(alert_id, 'expired')
 
     except Exception as e:
         logger.exception("Ошибка в schedule_alert")
         try:
-            update_alert_status(alert_id, 'error')
+            database.update_alert_status(alert_id, 'error')
         except Exception:
             pass
 
 
 def update_dynamic_timers_once(bot):
-    """
-    Однократный пересчёт всех активных алертов (вызывается при новых данных рынка).
-    """
     try:
-        active_alerts = get_active_alerts()
+        active_alerts = database.get_active_alerts()
         now = datetime.now()
         for alert in active_alerts:
             try:
-                records = get_recent_market(alert['resource'], minutes=15)
+                records = database.get_recent_market(alert['resource'], minutes=15)
                 if not records or len(records) < 2:
                     continue
 
-                latest = get_latest_market(alert['resource'])
+                latest = database.get_latest_market(alert['resource'])
                 if not latest:
                     continue
 
-                # Если данных в latest не больше чем при создании, пропускаем
                 created_ts = datetime.fromisoformat(alert['created_at']).timestamp() if alert.get('created_at') else 0
                 if latest['timestamp'] <= created_ts:
                     continue
 
-                bonus = get_user_bonus(alert['user_id'])
-                current_adj_price, _ = adjust_prices_for_user(alert['user_id'], latest['buy'], latest['sell'])
-                speed = calculate_speed(records, "buy")
-                if speed is None:
+                bonus = users.get_user_bonus(alert['user_id'])
+                current_adj_price, _ = users.adjust_prices_for_user(alert['user_id'], latest['buy'], latest['sell'])
+                speed_raw = calculate_speed(records, "buy")
+                if speed_raw is None:
                     continue
 
-                adj_speed = speed / (1 + bonus) if isinstance(bonus, float) else speed
-                # защитные проверки
-                if adj_speed == 0 or adj_speed is None:
+                adj_speed = speed_raw / (1 + bonus) if isinstance(bonus, float) else speed_raw
+                if adj_speed is None or adj_speed == 0:
                     continue
 
-                # Проверка тренда
                 current_trend = get_trend(records, "buy")
-                if (alert['direction'] == "down" and current_trend == "up") or \
-                   (alert['direction'] == "up" and current_trend == "down"):
-                    # уведомляем и меняем статус
+                if (alert['direction'] == "down" and current_trend == "up") or (alert['direction'] == "up" and current_trend == "down"):
                     try:
-                        bot.send_message(alert['user_id'],
-                                         f"⚠️ Тренд для {alert['resource']} изменился (теперь {current_trend}). Оповещение деактивировано.")
+                        bot.send_message(alert['user_id'], f"⚠️ Тренд для {alert['resource']} изменился (теперь {current_trend}). Оповещение будет деактивировано.")
                     except Exception:
                         pass
-                    update_alert_status(alert['id'], 'trend_changed')
+                    database.update_alert_status(alert['id'], 'trend_changed')
                     continue
 
-                # Проверка достижения цели
-                if (alert['direction'] == "down" and current_adj_price <= alert['target_price']) or \
-                   (alert['direction'] == "up" and current_adj_price >= alert['target_price']):
+                if (alert['direction'] == "down" and current_adj_price <= alert['target_price']) or (alert['direction'] == "up" and current_adj_price >= alert['target_price']):
                     try:
-                        bot.send_message(alert['user_id'],
-                                         f"🔔 {alert['resource']} достигла цели {alert['target_price']:.2f} (текущая: {current_adj_price:.2f}).")
+                        bot.send_message(alert['user_id'], f"🔔 {alert['resource']} достигла цели {alert['target_price']:.2f} (текущая: {current_adj_price:.2f}).")
                     except Exception:
                         pass
-                    update_alert_status(alert['id'], 'completed')
+                    database.update_alert_status(alert['id'], 'completed')
                     continue
 
-                # Новый пересчёт времени
                 price_diff = alert['target_price'] - current_adj_price
                 if (alert['direction'] == "down" and adj_speed >= 0) or (alert['direction'] == "up" and adj_speed <= 0):
-                    # Цена не движется в нужную сторону
                     continue
 
                 time_minutes = abs(price_diff) / abs(adj_speed)
                 new_alert_time = datetime.now() + timedelta(minutes=time_minutes)
 
-                update_alert_fields(alert['id'], {
+                database.update_alert_fields(alert['id'], {
                     'alert_time': new_alert_time.isoformat(),
                     'speed': adj_speed,
                     'current_price': current_adj_price
                 })
 
-                # Если разница в новых/старых временах > 5 минут — шлём уведомление
                 try:
                     old = datetime.fromisoformat(alert['alert_time']) if alert.get('alert_time') else None
                     if old:
                         diff_min = abs((new_alert_time - old).total_seconds() / 60.0)
                         if diff_min > 5:
-                            bot.send_message(alert['user_id'],
-                                             f"🔄 Таймер для {alert['resource']} обновлён. Новое время: {new_alert_time.strftime('%H:%M:%S')}")
+                            bot.send_message(alert['user_id'], f"🔄 Таймер для {alert['resource']} обновлён. Новое время: {new_alert_time.strftime('%H:%M:%S')}")
                 except Exception:
                     pass
 
             except Exception as e:
-                logger.exception(f"Ошибка при пересчёте алерта {alert.get('id')}: {e}")
+                logger.exception(f"Ошибка при обновлении алерта {alert.get('id')}: {e}")
     except Exception as e:
         logger.exception("Ошибка в update_dynamic_timers_once")
 
 
 def cleanup_expired_alerts_loop():
-    """
-    Каждые 10 минут отмечаем активные алерты, у которых alert_time старше часа назад.
-    """
     while True:
         try:
             now = datetime.now()
-            active = get_active_alerts()
+            active = database.get_active_alerts()
             expired_ids = []
             for a in active:
                 try:
@@ -213,11 +183,63 @@ def cleanup_expired_alerts_loop():
                 except Exception:
                     continue
             for aid in expired_ids:
-                update_alert_status(aid, 'cleanup_expired')
+                database.update_alert_status(aid, 'cleanup_expired')
                 logger.info(f"Очистка: деактивирован алерт {aid} (просрочен)")
         except Exception as e:
             logger.exception("Ошибка в cleanup_expired_alerts_loop")
-        time.sleep(600)  # 10 минут
+        time.sleep(600)
+
+
+def stale_db_reminder_loop(bot):
+    """
+    Если глобальная БД не обновлялась (нет новых market записей) — шлём напоминания пользователям и чатам,
+    с учётом индивидуальных интервалов и возможности отключения.
+    """
+    while True:
+        try:
+            global_ts = database.get_global_latest_timestamp()
+            now_ts = int(time.time())
+            if not global_ts:
+                # нет записей — считаем как "старо"
+                delta = None
+            else:
+                delta = now_ts - global_ts
+
+            # если база обновлялась недавно (< 15 мин) — спим и не шлём
+            if delta is not None and delta < 15 * 60:
+                # сбрасываем цикл ожидания
+                time.sleep(60)
+                continue
+
+            # БД не обновлялась — шлём напоминания по пользователям
+            users_list = database.get_users_with_notifications_enabled()
+            for u in users_list:
+                uid = u["id"]
+                interval = int(u.get("notify_interval", 15))
+                last = int(u.get("last_reminder", 0))
+                if now_ts - last >= interval * 60:
+                    try:
+                        bot.send_message(uid, "⚠️ База данных рынков не обновлялась более 15 минут. Пожалуйста, перешлите свежий форвард рынка (🎪). Вы можете отключить уведомления или изменить интервал в /push.")
+                    except Exception as e:
+                        logger.debug(f"Не удалось отправить напоминание пользователю {uid}: {e}")
+                    database.set_user_last_reminder(uid, now_ts)
+
+            # Чатовые напоминания
+            chats = database.get_chats_with_notifications_enabled()
+            for c in chats:
+                chat_id = c["chat_id"]
+                interval = int(c.get("notify_interval", 15))
+                last = int(c.get("last_reminder", 0))
+                if now_ts - last >= interval * 60:
+                    try:
+                        bot.send_message(chat_id, "⚠️ Внимание: база данных рынков не обновлялась более 15 минут. Пожалуйста, пришлите форвард рынка или проверьте, что бот имеет доступ к сообщениям.")
+                    except Exception as e:
+                        logger.debug(f"Не удалось отправить напоминание в чат {chat_id}: {e}")
+                    database.set_chat_last_reminder(chat_id, now_ts)
+
+        except Exception as e:
+            logger.exception("Ошибка в stale_db_reminder_loop")
+        time.sleep(60)
 
 
 def update_dynamic_timers_loop(bot):
@@ -225,23 +247,21 @@ def update_dynamic_timers_loop(bot):
         try:
             update_dynamic_timers_once(bot)
         except Exception as e:
-            logger.exception("Ошибка в цикле update_dynamic_timers_loop")
+            logger.exception("Ошибка в update_dynamic_timers_loop")
         time.sleep(60)
 
 
 def start_background_tasks(bot):
-    # Запускаем потоки для фона
     t1 = threading.Thread(target=cleanup_expired_alerts_loop, daemon=True)
     t1.start()
     t2 = threading.Thread(target=update_dynamic_timers_loop, args=(bot,), daemon=True)
     t2.start()
+    t3 = threading.Thread(target=stale_db_reminder_loop, args=(bot,), daemon=True)
+    t3.start()
 
 
+# Команда /timer handler
 def cmd_timer_handler(bot, message):
-    """
-    Команда /timer <ресурс> <цель>
-    Аналогично логике из основного скрипта — добавляем алерт и запускаем schedule_alert.
-    """
     try:
         parts = message.text.split()[1:]
         if len(parts) != 2:
@@ -258,49 +278,36 @@ def cmd_timer_handler(bot, message):
             bot.reply_to(message, "❌ Неверный формат цены. Пример: 8.50")
             return
 
-        # Проверки и расчёты
-        latest = get_latest_market(resource)
+        latest = database.get_latest_market(resource)
         if not latest:
             bot.reply_to(message, f"⚠️ Нет данных по {resource}. Пришлите форвард рынка.")
             return
 
-        # Берём последние 15 минут
-        records = get_recent_market(resource, minutes=15)
+        records = database.get_recent_market(resource, minutes=15)
         if len(records) < 2:
             bot.reply_to(message, f"⚠️ Недостаточно данных за 15 минут для {resource}.")
             return
 
-        # Текущая "сырая" цена
         current_raw_buy = latest['buy']
-        current_raw_sell = latest['sell']
-
-        # Корректируем для пользователя (тот, кто запрашивает таймер)
         user_id = message.from_user.id
-        current_buy_adj, current_sell_adj = adjust_prices_for_user(user_id, current_raw_buy, current_raw_sell)
-        bonus = get_user_bonus(user_id)
-
-        # Направление
+        current_buy_adj, _ = users.adjust_prices_for_user(user_id, current_raw_buy, latest['sell'])
+        bonus = users.get_user_bonus(user_id)
         direction = "down" if target_price < current_buy_adj else "up"
 
-        # Скорость (на базе сырых данных)
         speed_raw = calculate_speed(records, "buy")
         if speed_raw is None:
             bot.reply_to(message, "⚠️ Не удалось рассчитать скорость изменения цены.")
             return
 
-        # Приведенная скорость для пользователя
         adj_speed = speed_raw / (1 + bonus) if isinstance(bonus, float) else speed_raw
         if adj_speed == 0:
             bot.reply_to(message, "⚠️ Скорость изменения слишком мала.")
             return
 
-        # Проверки направления
-        if (direction == "down" and target_price >= current_buy_adj) or \
-           (direction == "up" and target_price <= current_buy_adj):
+        if (direction == "down" and target_price >= current_buy_adj) or (direction == "up" and target_price <= current_buy_adj):
             bot.reply_to(message, f"⚠️ Целевая цена должна быть {'ниже' if direction == 'down' else 'выше'} текущей ({current_buy_adj:.2f}).")
             return
 
-        # Проверка тренда
         trend = get_trend(records, "buy")
         if (direction == "down" and trend == "up") or (direction == "up" and trend == "down"):
             bot.reply_to(message, "⚠️ Внимание — выбранное направление противоречит текущему тренду. Оповещение может не сработать.")
@@ -315,9 +322,8 @@ def cmd_timer_handler(bot, message):
 
         chat_id = message.chat.id if message.chat.type in ['group', 'supergroup'] else None
 
-        alert_id = insert_alert_record(user_id, resource, target_price, direction, adj_speed, current_buy_adj, alert_time.isoformat(), chat_id)
+        alert_id = database.insert_alert_record(user_id, resource, target_price, direction, adj_speed, current_buy_adj, alert_time.isoformat(), chat_id)
 
-        # Отправляем подтверждение
         alert_time_str = alert_time.strftime("%H:%M:%S")
         username = message.from_user.username or str(message.from_user.id)
         notify = (
@@ -332,14 +338,13 @@ def cmd_timer_handler(bot, message):
         )
         sent = bot.reply_to(message, notify)
 
-        # Закрепление в группе (если группа)
         if chat_id and chat_id != user_id:
             try:
                 bot.pin_chat_message(chat_id, sent.message_id, disable_notification=True)
-            except Exception as e:
-                logger.warning(f"Не удалось закрепить сообщение в группе {chat_id}: {e}")
+                database.upsert_chat_settings(chat_id, True, database.get_chat_settings(chat_id)["notify_interval"], pinned_message_id=sent.message_id)
+            except Exception:
+                pass
 
-        # Запуск фонового ожидания для этого алерта
         threading.Thread(target=schedule_alert, args=(alert_id, bot), daemon=True).start()
 
     except Exception as e:
