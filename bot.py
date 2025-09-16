@@ -1,4 +1,3 @@
-# bot.py
 import logging
 import telebot
 from telebot import types
@@ -20,7 +19,7 @@ alerts.start_background_tasks(bot)
 @bot.message_handler(commands=['start'])
 def cmd_start(message):
     users.ensure_user(message.from_user.id, message.from_user.username)
-    welcome = f"Привет, @{message.from_user.username}! Бот BS Market Analytics запущен.\n\nДоступные команды:\n/stat - Статистика\n/history [ресурс] - История\n/timer <ресурс> <цена> - Таймер\n/status - Оповещения\n/settings - Настройки\n/push - Уведомления\n/help - Помощь\n\nПерешлите 🎪 для обновления рынка."
+    welcome = f"Привет, @{message.from_user.username}! Бот BS Market Analytics запущен.\n\nДоступные команды:\n/stat - Статистика\n/history [ресурс] - История\n/status - Ваши алерты\n/cancel - Отмена алертов\n/settings - Бонусы\n/push - Настройка уведомлений"
     bot.reply_to(message, welcome)
 
 @bot.message_handler(commands=['help'])
@@ -36,7 +35,7 @@ def cmd_stat(message):
     update_str = datetime.fromtimestamp(global_ts).strftime("%d.%m.%Y %H:%M") if global_ts else "Неизвестно"
 
     resources = ['Дерево', 'Камень', 'Провизия', 'Лошади']
-    reply = f"📊 Текущая статистика рынка\n🕗 Обновлено: {update_str}\n🔃 Бонус игрока: {bonus_pct}%\n──────────────────────\n\n"
+    reply = f"📊 Текущая статистика рынка\n🕗 Обновлено: {update_str}\n🔃 Бонус игрока: {bonus_pct}%\n──────────────────────\n"
     week_start = int(time.time()) - 7*24*3600
 
     for res in resources:
@@ -44,7 +43,11 @@ def cmd_stat(message):
         if pred_buy is None:
             continue
         last_update_str = datetime.fromtimestamp(last_ts).strftime("%H:%M") if last_ts else "N/A"
-        was_buy, was_sell = users.adjust_prices_for_user(user_id, database.get_market_week_max_qty(res, 'buy', week_start)[0], database.get_market_week_max_qty(res, 'sell', week_start)[0])  # simplified
+        was_buy, was_sell = users.adjust_prices_for_user(
+            user_id,
+            database.get_market_week_max_qty(res, 'buy', week_start)[0],
+            database.get_market_week_max_qty(res, 'sell', week_start)[0]
+        )  # simplified
         buy_range = database.get_market_week_range(res, 'buy', week_start)
         sell_range = database.get_market_week_range(res, 'sell', week_start)
         max_qty = database.get_market_week_max_qty(res, week_start)
@@ -59,7 +62,7 @@ def cmd_stat(message):
         reply += f"├ 📦 Макс. объём: {max_qty:,} шт.\n"
         reply += f"└ 📊 Тренд: {trend_emoji} {'растёт' if trend=='up' else 'падает' if trend=='down' else 'стабилен'} ({speed_str})\n\n"
 
-    reply += "──────────────────────\n📈 — рост | 📉 — падение | ➖ — стабильно\nЦены скорректированы с учетом бонусов игрока ({bonus_pct}%)."
+    reply += "──────────────────────\n📈 — рост | 📉 — падение | ➖ — стабильно\nЦены скорректированы с учетом бонусов игрока."
     bot.reply_to(message, reply)
 
 @bot.message_handler(commands=['history'])
@@ -90,7 +93,7 @@ def cmd_history(message):
         reply += "\n"
     trend = market.get_trend(records, "buy")
     speed = alerts.calculate_speed(records, "buy")
-    trend_str = f"Тренд: {'падает 📉' if trend=='down' else 'растёт 📈' if trend=='up' else 'стабилен ➖'} ({speed:+.4f}/мин)" if speed else "Тренд: стабильный"
+    trend_str = f"Тренд: {'падает 📉' if trend=='down' else 'растёт 📈' if trend=='up' else 'стабилен ➖'} ({speed:+.4f}/мин)" if speed else "Тренд: стабилен ➖"
     reply += trend_str
     bot.reply_to(message, reply)
 
