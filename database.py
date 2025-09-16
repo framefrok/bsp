@@ -227,6 +227,14 @@ def get_market_week_range(resource: str, price_field: str, week_start: int) -> T
     conn.close()
     return (row['minp'], row['maxp']) if row else (0, 0)
 
+def get_market_week_max_price(resource: str, price_field: str, week_start: int) -> float:
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute(f"SELECT MAX({price_field}) as maxp FROM market WHERE resource=? AND timestamp>=?", (resource, week_start))
+    row = c.fetchone()
+    conn.close()
+    return row['maxp'] if row and row['maxp'] is not None else 0.0
+
 def get_market_week_max_qty(resource: str, week_start: int) -> int:
     conn = get_connection()
     c = conn.cursor()
