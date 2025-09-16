@@ -237,17 +237,45 @@ def update_dynamic_timers_loop(bot):
         time.sleep(60)
 
 
+def check_profit_alerts(bot):
+    while True:
+        try:
+            chats = database.get_chats_with_profit_alerts()
+            for chat in chats:
+                chat_id = chat['chat_id']
+                alerts = database.get_chat_profit_alerts(chat_id)
+                latest = database.get_latest_market_all()
+                for alert in alerts:
+                    resource = alert['resource']
+                    threshold = alert['threshold_price']
+                    min_qty = alert['min_quantity']
+                    current = next((r for r in latest if r['resource'] == resource), None)
+                    if current and current['buy'] <= threshold and current['quantity'] >= min_qty:
+                        try:
+                            bot.send_message(chat_id, f"@all Пора брать! {resource} Ожидает твоей покупки.")
+                            database.deactivate_profit_alert(chat_id, resource)
+                        except Exception:
+                            pass
+        except Exception as e:
+            logger.exception("Ошибка в check_profit_alerts")
+        time.sleep(300)
+
+
 def start_background_tasks(bot):
     threading.Thread(target=cleanup_expired_alerts_loop, daemon=True).start()
     threading.Thread(target=update_dynamic_timers_loop, args=(bot,), daemon=True).start()
     threading.Thread(target=stale_db_reminder_loop, args=(bot,), daemon=True).start()
+    threading.Thread(target=check_profit_alerts, args=(bot,), daemon=True).start()
 
 
 def cmd_timer_handler(bot, message):
     try:
         parts = message.text.split()[1:]
         if len(parts) != 2:
-            bot.reply_to(message, "❌ Формат команды: /timer <ресурс> <целевая цена>\nПример: /timer Дерево 8.50")
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("📉 Down (падение)", callback_data="timer_down"))
+            markup.add(types.InlineKeyboardButton("📈 Up (рост)", callback_data="timer_up"))
+            bot.reply_to(message, f"Выберите направление для /timer {parts[0] if parts else ''} {parts[1] if len(parts)>1 else ''}:", reply_markup=markup)
             return
 
         resource = parts[0].capitalize()
@@ -332,3 +360,43 @@ def cmd_timer_handler(bot, message):
     except Exception:
         logger.exception("Ошибка в cmd_timer_handler")
         bot.reply_to(message, "❌ Произошла ошибка при установке таймера.")
+
+
+def cmd_status_handler(bot, message):
+    user_id = message.from_user.id
+    alerts = database.get_user_active_alerts(user_id)
+    if not alerts:
+        bot.reply_to(message, "📋 У вас нет активных оповещений.")
+        return
+    reply = "📋 Ваши активные оповещения:\n\n"
+    for a in alerts:
+        time_left = datetime.fromisoformat(a['alert_time']) - datetime.now()
+        if time_left.total_seconds() > 0:
+            left_str = f"{int(time_left.total_seconds() // 60)} мин. {int(time_left.total_seconds() % 60)} сек."
+            time_str = datetime.fromisoformat(a['alert_time']).strftime("%H:%M:%S")
+            reply += f"• {a['resource']} → {a['target_price']:.2f} ({'падение' if a['direction']=='down' else 'рост'})\n  Осталось: {left_str}\n  Сработает в: {time_str}\n\n"
+    bot.reply_to(message, reply)
+
+
+def cmd_cancel_handler(bot, message):
+    user_id = message.from_user.id
+    count = database.cancel_user_alerts(user_id)
+    bot.reply_to(message, f"🗑️ Удалено {count} активных оповещений.")
+
+
+def cmd_help_handler(bot, message):
+    help_text = """
+🆘 Инструкция по использованию бота:
+
+📊 /stat - Текущая статистика рынка с прогнозами и трендами.
+📜 /history [ресурс] - История цен за 24 часа (ресурс: Дерево, Камень, Провизия, Лошади).
+🔔 /timer <ресурс> <цена> - Установить таймер на достижение цены (с кнопками up/down).
+📋 /status - Показать активные оповещения.
+🗑️ /cancel - Удалить все оповещения.
+⚙️ /settings - Настроить якорь и уровень торговли.
+⚡ /push - Настройки уведомлений и интервалов.
+🎪 Перешлите сообщение рынка для обновления данных.
+
+Для групп: Бот может уведомлять @all о выгодных сделках и закреплять сообщения.
+    """
+    bot.reply_to(message, help_text)
