@@ -233,22 +233,28 @@ def cmd_buyalert(message):
         return
 
     chat_id = message.chat.id
-    # Вставляем или обновляем алерт
     conn = database.get_connection()
     c = conn.cursor()
+
+    # Сначала попробуем обновить
     c.execute("""
-        INSERT INTO chat_profit_alerts (chat_id, resource, threshold_price, min_quantity, active)
-        VALUES (?, ?, ?, ?, 1)
-        ON CONFLICT(chat_id, resource) DO UPDATE SET
-        threshold_price=excluded.threshold_price,
-        min_quantity=excluded.min_quantity,
-        active=1
-    """, (chat_id, resource, threshold, min_qty))
+        UPDATE chat_profit_alerts
+        SET threshold_price = ?, min_quantity = ?, active = 1
+        WHERE chat_id = ? AND resource = ?
+    """, (threshold, min_qty, chat_id, resource))
+
+    # Если обновлено 0 строк — значит, записи не было, вставляем новую
+    if c.rowcount == 0:
+        c.execute("""
+            INSERT INTO chat_profit_alerts (chat_id, resource, threshold_price, min_quantity, active)
+            VALUES (?, ?, ?, ?, 1)
+        """, (chat_id, resource, threshold, min_qty))
+
     conn.commit()
     conn.close()
 
     bot.reply_to(message, f"✅ Алерт установлен: @{message.from_user.username} хочет купить {resource} по цене ≤ {threshold} при наличии ≥ {min_qty} шт.")
-
+    
 def main():
     logger.info("Бот запущен.")
     try:
